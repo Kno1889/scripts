@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Audio File Classifier
-Classifies MP3 and M4A files into English lyrics vs non-English/instrumental
-using audio analysis with OpenAI's Whisper model.
+Classifies MP3 and M4A files into three categories:
+- songs: Files with English lyrics (2+ samples pass)
+- ambiguous: Movie scenes, sparse dialogue (1 sample passes)
+- other: Instrumental or non-English (0 samples pass)
+
+Uses OpenAI's Whisper model for speech recognition and language detection.
 """
 
 import argparse
@@ -26,32 +30,84 @@ except ImportError:
 from tqdm import tqdm
 
 
-def extract_audio_sample(audio_path: Path, sample_duration_ms: int = 60000) -> Path:
-    """
-    Extract a sample from the middle of the audio file for analysis.
-    Analyzing the middle helps avoid intros/outros that may not have vocals.
-    Supports MP3 and M4A formats.
-    """
+def load_audio(audio_path: Path) -> AudioSegment:
+    """Load audio file based on its format."""
     suffix = audio_path.suffix.lower()
     if suffix == '.mp3':
-        audio = AudioSegment.from_mp3(audio_path)
+        return AudioSegment.from_mp3(audio_path)
     elif suffix == '.m4a':
-        audio = AudioSegment.from_file(audio_path, format='m4a')
+        return AudioSegment.from_file(audio_path, format='m4a')
     else:
-        audio = AudioSegment.from_file(audio_path)
+        return AudioSegment.from_file(audio_path)
 
-    # Get sample from the middle of the track
+
+def extract_audio_sample(
+    audio: AudioSegment,
+    audio_path: Path,
+    sample_duration_ms: int,
+    position: float,
+    sample_index: int = 0
+) -> tuple[Path, int]:
+    """
+    Extract a sample from a specific position in the audio.
+
+    Args:
+        audio: Loaded AudioSegment
+        audio_path: Original file path (for temp file naming)
+        sample_duration_ms: Duration of sample in milliseconds
+        position: Position as fraction (0.0 = start, 0.5 = middle, 1.0 = end)
+        sample_index: Index for temp file naming
+
+    Returns:
+        Tuple of (temp_wav_path, actual_duration_ms)
+    """
     duration = len(audio)
+
     if duration <= sample_duration_ms:
         sample = audio
+        actual_duration = duration
     else:
-        start = (duration - sample_duration_ms) // 2
+        # Calculate start position, ensuring we don't go past the end
+        max_start = duration - sample_duration_ms
+        start = int(max_start * position)
         sample = audio[start:start + sample_duration_ms]
+        actual_duration = sample_duration_ms
 
-    # Export as WAV for Whisper (better compatibility)
-    temp_path = audio_path.with_suffix('.temp.wav')
+    # Export as WAV for Whisper
+    temp_path = audio_path.with_suffix(f'.temp{sample_index}.wav')
     sample.export(temp_path, format='wav')
-    return temp_path
+    return temp_path, actual_duration
+
+
+def extract_multiple_samples(
+    audio_path: Path,
+    sample_duration_ms: int = 30000,
+    positions: list[float] = None
+) -> list[tuple[Path, int]]:
+    """
+    Extract multiple samples from different positions in the audio.
+
+    Args:
+        audio_path: Path to audio file
+        sample_duration_ms: Duration of each sample
+        positions: List of positions as fractions (default: [0.25, 0.5, 0.75])
+
+    Returns:
+        List of (temp_wav_path, actual_duration_ms) tuples
+    """
+    if positions is None:
+        positions = [0.25, 0.5, 0.75]
+
+    audio = load_audio(audio_path)
+    samples = []
+
+    for i, pos in enumerate(positions):
+        temp_path, duration = extract_audio_sample(
+            audio, audio_path, sample_duration_ms, pos, i
+        )
+        samples.append((temp_path, duration))
+
+    return samples
 
 
 def analyze_audio(model, audio_path: Path) -> dict:
@@ -70,64 +126,131 @@ def analyze_audio(model, audio_path: Path) -> dict:
     }
 
 
-def is_english_lyrics(analysis: dict, min_text_length: int = 20) -> bool:
+def count_words(text: str) -> int:
+    """Count words in text."""
+    return len(text.split())
+
+
+def is_english_lyrics(
+    analysis: dict,
+    sample_duration_ms: int,
+    min_words_per_minute: int = 30
+) -> bool:
     """
-    Determine if the audio contains English lyrics.
+    Determine if the audio sample contains English lyrics.
 
     Criteria:
     - Language detected as English
-    - Has substantial transcribed text (not just noise/silence)
+    - Word density meets minimum threshold (filters out sparse dialogue)
+
+    Args:
+        analysis: Dict with 'language' and 'text' from Whisper
+        sample_duration_ms: Duration of the analyzed sample
+        min_words_per_minute: Minimum words per minute to qualify as lyrics
+                              (typical lyrics: 40-80 wpm, dialogue: 10-30 wpm)
     """
     if analysis['language'] != 'en':
         return False
 
-    # Check if there's enough text to consider it "lyrics"
     text = analysis['text']
-    if len(text) < min_text_length:
+    word_count = count_words(text)
+
+    # Calculate words per minute
+    duration_minutes = sample_duration_ms / 60000
+    if duration_minutes <= 0:
         return False
 
-    return True
+    words_per_minute = word_count / duration_minutes
+
+    return words_per_minute >= min_words_per_minute
 
 
-def classify_audio(model, audio_path: Path, sample_duration_ms: int = 60000) -> tuple[bool, dict]:
+def classify_audio(
+    model,
+    audio_path: Path,
+    sample_duration_ms: int = 30000,
+    min_words_per_minute: int = 30,
+) -> tuple[str, dict]:
     """
-    Classify a single audio file (MP3 or M4A).
-    Returns (is_english, analysis_details).
+    Classify a single audio file using multi-sample analysis.
+
+    Extracts 3 samples from different positions (25%, 50%, 75%) and classifies
+    based on how many samples pass the English lyrics test.
+
+    Args:
+        model: Loaded Whisper model
+        audio_path: Path to audio file
+        sample_duration_ms: Duration of each sample (default: 30s)
+        min_words_per_minute: Minimum word density threshold
+
+    Returns:
+        (category, analysis_details) where category is:
+        - 'songs': 2+ samples passed (confident English lyrics)
+        - 'ambiguous': 1 sample passed (movie scenes, sparse vocals)
+        - 'other': 0 samples passed (instrumental/non-English)
     """
-    temp_wav = None
+    temp_files = []
     try:
-        # Extract sample for analysis
-        temp_wav = extract_audio_sample(audio_path, sample_duration_ms)
+        # Extract 3 samples from different positions
+        samples = extract_multiple_samples(audio_path, sample_duration_ms)
+        temp_files = [s[0] for s in samples]
 
-        # Analyze with Whisper
-        analysis = analyze_audio(model, temp_wav)
+        # Analyze each sample
+        passed_samples = 0
+        all_text = []
+        detected_languages = []
 
-        # Determine classification
-        has_english = is_english_lyrics(analysis)
+        for temp_path, duration in samples:
+            analysis = analyze_audio(model, temp_path)
+            all_text.append(analysis['text'])
+            detected_languages.append(analysis['language'])
 
-        return has_english, analysis
+            if is_english_lyrics(analysis, duration, min_words_per_minute):
+                passed_samples += 1
+
+        # Determine category based on passed samples
+        if passed_samples >= 2:
+            category = 'songs'
+        elif passed_samples == 1:
+            category = 'ambiguous'
+        else:
+            category = 'other'
+
+        # Combine analysis info for reporting
+        combined_analysis = {
+            'language': max(set(detected_languages), key=detected_languages.count),
+            'text': ' | '.join(all_text),
+            'samples_passed': passed_samples,
+            'samples_total': len(samples),
+        }
+
+        return category, combined_analysis
 
     finally:
-        # Clean up temp file
-        if temp_wav and temp_wav.exists():
-            temp_wav.unlink()
+        # Clean up temp files
+        for temp_file in temp_files:
+            if temp_file.exists():
+                temp_file.unlink()
 
 
 def process_folder(
     input_folder: Path,
-    output_english: Path,
+    output_songs: Path,
+    output_ambiguous: Path,
     output_other: Path,
     model_name: str = "base",
-    sample_duration: int = 60,
+    sample_duration: int = 30,
+    min_words_per_minute: int = 30,
     dry_run: bool = False,
     copy_files: bool = False,
 ):
     """
-    Process all MP3 files in the input folder and classify them.
+    Process all audio files in the input folder and classify them into 3 categories.
     """
     # Create output directories
     if not dry_run:
-        output_english.mkdir(parents=True, exist_ok=True)
+        output_songs.mkdir(parents=True, exist_ok=True)
+        output_ambiguous.mkdir(parents=True, exist_ok=True)
         output_other.mkdir(parents=True, exist_ok=True)
 
     # Load Whisper model
@@ -150,9 +273,17 @@ def process_folder(
     print(f"Found {len(audio_files)} audio file(s) to process.\n")
 
     results = {
-        'english': [],
+        'songs': [],
+        'ambiguous': [],
         'other': [],
         'errors': [],
+    }
+
+    # Map categories to output folders
+    category_folders = {
+        'songs': output_songs,
+        'ambiguous': output_ambiguous,
+        'other': output_other,
     }
 
     progress_bar = tqdm(
@@ -166,20 +297,15 @@ def process_folder(
         progress_bar.set_postfix_str(audio_file.name[:30])
 
         try:
-            is_english, analysis = classify_audio(
+            category, analysis = classify_audio(
                 model,
                 audio_file,
-                sample_duration_ms=sample_duration * 1000
+                sample_duration_ms=sample_duration * 1000,
+                min_words_per_minute=min_words_per_minute,
             )
 
-            lang = analysis['language']
-
-            if is_english:
-                dest_folder = output_english
-                results['english'].append(audio_file.name)
-            else:
-                dest_folder = output_other
-                results['other'].append(audio_file.name)
+            dest_folder = category_folders[category]
+            results[category].append(audio_file.name)
 
             # Move or copy file
             if not dry_run:
@@ -199,9 +325,10 @@ def process_folder(
     print("=" * 50)
     print("SUMMARY")
     print("=" * 50)
-    print(f"English lyrics:     {len(results['english'])} files")
-    print(f"Non-English/Other:  {len(results['other'])} files")
-    print(f"Errors:             {len(results['errors'])} files")
+    print(f"Songs (English lyrics):  {len(results['songs'])} files")
+    print(f"Ambiguous (movie/other): {len(results['ambiguous'])} files")
+    print(f"Other (instrumental):    {len(results['other'])} files")
+    print(f"Errors:                  {len(results['errors'])} files")
 
     if results['errors']:
         print("\nFiles with errors:")
@@ -211,12 +338,17 @@ def process_folder(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Classify audio files (MP3/M4A) into English lyrics vs non-English/instrumental",
+        description="Classify audio files (MP3/M4A) into songs, ambiguous, and other categories",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Categories:
+  songs/      - English lyrics (2+ of 3 samples pass word density check)
+  ambiguous/  - Movie scenes, sparse dialogue (1 of 3 samples pass)
+  other/      - Instrumental or non-English (0 samples pass)
+
 Examples:
   %(prog)s /path/to/music
-  %(prog)s /path/to/music --model small --sample-duration 90
+  %(prog)s /path/to/music --model small
   %(prog)s /path/to/music --dry-run
   %(prog)s /path/to/music --copy
         """
@@ -229,17 +361,24 @@ Examples:
     )
 
     parser.add_argument(
-        "--output-english",
+        "--output-songs",
         type=Path,
         default=None,
-        help="Folder for English lyrics files (default: input_folder/english)"
+        help="Folder for songs with English lyrics (default: input_folder/songs)"
+    )
+
+    parser.add_argument(
+        "--output-ambiguous",
+        type=Path,
+        default=None,
+        help="Folder for ambiguous files like movie scenes (default: input_folder/ambiguous)"
     )
 
     parser.add_argument(
         "--output-other",
         type=Path,
         default=None,
-        help="Folder for non-English/instrumental files (default: input_folder/other)"
+        help="Folder for instrumental/non-English files (default: input_folder/other)"
     )
 
     parser.add_argument(
@@ -253,8 +392,15 @@ Examples:
     parser.add_argument(
         "--sample-duration",
         type=int,
-        default=60,
-        help="Duration in seconds of audio sample to analyze (default: 60)"
+        default=30,
+        help="Duration in seconds of each audio sample (default: 30). Three samples are taken per file."
+    )
+
+    parser.add_argument(
+        "--min-wpm",
+        type=int,
+        default=30,
+        help="Minimum words per minute to classify as lyrics (default: 30). Typical lyrics: 40-80 wpm."
     )
 
     parser.add_argument(
@@ -281,16 +427,19 @@ Examples:
         sys.exit(1)
 
     # Set default output folders
-    output_english = args.output_english or (args.input_folder / "english")
+    output_songs = args.output_songs or (args.input_folder / "songs")
+    output_ambiguous = args.output_ambiguous or (args.input_folder / "ambiguous")
     output_other = args.output_other or (args.input_folder / "other")
 
     # Run classification
     process_folder(
         input_folder=args.input_folder,
-        output_english=output_english,
+        output_songs=output_songs,
+        output_ambiguous=output_ambiguous,
         output_other=output_other,
         model_name=args.model,
         sample_duration=args.sample_duration,
+        min_words_per_minute=args.min_wpm,
         dry_run=args.dry_run,
         copy_files=args.copy,
     )
