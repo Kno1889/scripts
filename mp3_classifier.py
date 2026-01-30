@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MP3 File Classifier
-Classifies MP3 files into English lyrics vs non-English/instrumental
+Audio File Classifier
+Classifies MP3 and M4A files into English lyrics vs non-English/instrumental
 using audio analysis with OpenAI's Whisper model.
 """
 
@@ -23,13 +23,22 @@ except ImportError:
     print("Error: pydub not installed. Run: pip install pydub")
     sys.exit(1)
 
+from tqdm import tqdm
 
-def extract_audio_sample(mp3_path: Path, sample_duration_ms: int = 60000) -> Path:
+
+def extract_audio_sample(audio_path: Path, sample_duration_ms: int = 60000) -> Path:
     """
     Extract a sample from the middle of the audio file for analysis.
     Analyzing the middle helps avoid intros/outros that may not have vocals.
+    Supports MP3 and M4A formats.
     """
-    audio = AudioSegment.from_mp3(mp3_path)
+    suffix = audio_path.suffix.lower()
+    if suffix == '.mp3':
+        audio = AudioSegment.from_mp3(audio_path)
+    elif suffix == '.m4a':
+        audio = AudioSegment.from_file(audio_path, format='m4a')
+    else:
+        audio = AudioSegment.from_file(audio_path)
 
     # Get sample from the middle of the track
     duration = len(audio)
@@ -40,7 +49,7 @@ def extract_audio_sample(mp3_path: Path, sample_duration_ms: int = 60000) -> Pat
         sample = audio[start:start + sample_duration_ms]
 
     # Export as WAV for Whisper (better compatibility)
-    temp_path = mp3_path.with_suffix('.temp.wav')
+    temp_path = audio_path.with_suffix('.temp.wav')
     sample.export(temp_path, format='wav')
     return temp_path
 
@@ -80,15 +89,15 @@ def is_english_lyrics(analysis: dict, min_text_length: int = 20) -> bool:
     return True
 
 
-def classify_mp3(model, mp3_path: Path, sample_duration_ms: int = 60000) -> tuple[bool, dict]:
+def classify_audio(model, audio_path: Path, sample_duration_ms: int = 60000) -> tuple[bool, dict]:
     """
-    Classify a single MP3 file.
+    Classify a single audio file (MP3 or M4A).
     Returns (is_english, analysis_details).
     """
     temp_wav = None
     try:
         # Extract sample for analysis
-        temp_wav = extract_audio_sample(mp3_path, sample_duration_ms)
+        temp_wav = extract_audio_sample(audio_path, sample_duration_ms)
 
         # Analyze with Whisper
         analysis = analyze_audio(model, temp_wav)
@@ -126,14 +135,19 @@ def process_folder(
     model = whisper.load_model(model_name)
     print("Model loaded.\n")
 
-    # Find all MP3 files
-    mp3_files = list(input_folder.glob("*.mp3")) + list(input_folder.glob("*.MP3"))
+    # Find all audio files (MP3 and M4A)
+    audio_files = (
+        list(input_folder.glob("*.mp3")) +
+        list(input_folder.glob("*.MP3")) +
+        list(input_folder.glob("*.m4a")) +
+        list(input_folder.glob("*.M4A"))
+    )
 
-    if not mp3_files:
-        print(f"No MP3 files found in {input_folder}")
+    if not audio_files:
+        print(f"No MP3 or M4A files found in {input_folder}")
         return
 
-    print(f"Found {len(mp3_files)} MP3 file(s) to process.\n")
+    print(f"Found {len(audio_files)} audio file(s) to process.\n")
 
     results = {
         'english': [],
@@ -141,50 +155,45 @@ def process_folder(
         'errors': [],
     }
 
-    for i, mp3_file in enumerate(mp3_files, 1):
-        print(f"[{i}/{len(mp3_files)}] Processing: {mp3_file.name}")
+    progress_bar = tqdm(
+        audio_files,
+        desc="Classifying",
+        unit="file",
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+    )
+
+    for audio_file in progress_bar:
+        progress_bar.set_postfix_str(audio_file.name[:30])
 
         try:
-            is_english, analysis = classify_mp3(
+            is_english, analysis = classify_audio(
                 model,
-                mp3_file,
+                audio_file,
                 sample_duration_ms=sample_duration * 1000
             )
 
             lang = analysis['language']
-            text_preview = analysis['text'][:80] + "..." if len(analysis['text']) > 80 else analysis['text']
 
             if is_english:
-                print(f"  → English lyrics detected (lang={lang})")
-                print(f"    Preview: \"{text_preview}\"")
                 dest_folder = output_english
-                results['english'].append(mp3_file.name)
+                results['english'].append(audio_file.name)
             else:
-                reason = "no English" if lang != 'en' else "insufficient text"
-                print(f"  → Non-English/Instrumental ({reason}, lang={lang})")
-                if text_preview:
-                    print(f"    Preview: \"{text_preview}\"")
                 dest_folder = output_other
-                results['other'].append(mp3_file.name)
+                results['other'].append(audio_file.name)
 
             # Move or copy file
             if not dry_run:
-                dest_path = dest_folder / mp3_file.name
+                dest_path = dest_folder / audio_file.name
                 if copy_files:
-                    shutil.copy2(mp3_file, dest_path)
-                    print(f"  → Copied to: {dest_folder.name}/")
+                    shutil.copy2(audio_file, dest_path)
                 else:
-                    shutil.move(str(mp3_file), str(dest_path))
-                    print(f"  → Moved to: {dest_folder.name}/")
-            else:
-                action = "copy" if copy_files else "move"
-                print(f"  → Would {action} to: {dest_folder.name}/ (dry run)")
+                    shutil.move(str(audio_file), str(dest_path))
 
         except Exception as e:
-            print(f"  → Error: {e}")
-            results['errors'].append((mp3_file.name, str(e)))
+            results['errors'].append((audio_file.name, str(e)))
 
-        print()
+    progress_bar.close()
+    print()
 
     # Summary
     print("=" * 50)
@@ -202,7 +211,7 @@ def process_folder(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Classify MP3 files into English lyrics vs non-English/instrumental",
+        description="Classify audio files (MP3/M4A) into English lyrics vs non-English/instrumental",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -216,7 +225,7 @@ Examples:
     parser.add_argument(
         "input_folder",
         type=Path,
-        help="Folder containing MP3 files to classify"
+        help="Folder containing MP3/M4A files to classify"
     )
 
     parser.add_argument(
