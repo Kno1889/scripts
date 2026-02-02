@@ -10,15 +10,14 @@ from tqdm import tqdm
 
 
 # Configuration
-AUDIO_DIR = "./audio_files"
-HAS_LYRICS_DIR = "./Has-lyrics"
-LYRICLESS_DIR = "./lyricless"
-UNSURE_DIR = "./unsure"
+AUDIO_DIR = "./audio"
+HAS_LYRICS_DIR = "./audio/Has-lyrics"
+LYRICLESS_DIR = "./audio/lyricless"
+UNSURE_DIR = "./audio/unsure"
 
-NUM_SAMPLES = 4
+NUM_SAMPLES = 3
 SAMPLE_DURATION_MS = 10000  # 10 seconds per sample
 EXCLUDE_PERCENT = 0.10  # Exclude first and last 10%
-LYRICS_THRESHOLD = 2  # Need 2+ samples with speech to classify as "Has-lyrics"
 WHISPER_MODEL = "base"  # Options: tiny, base, small, medium, large
 
 
@@ -112,12 +111,15 @@ def classify_audio_file(file_path: str, model) -> str:
             results[result] += 1
 
         # Classify based on results
-        if results["ambiguous"] > NUM_SAMPLES // 2:
-            return "unsure"
-        elif results["speech"] >= LYRICS_THRESHOLD:
-            return "has_lyrics"
-        else:
+        # 0 samples with speech → lyricless
+        # 1 sample with speech → unsure
+        # 2-3 samples with speech → has_lyrics
+        if results["speech"] == 0:
             return "lyricless"
+        elif results["speech"] == 1:
+            return "unsure"
+        else:
+            return "has_lyrics"
 
     except Exception as e:
         print(f"    Error processing file: {e}")

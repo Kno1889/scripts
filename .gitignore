@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 *.temp.wav
 audio_files/
+.DS_Store
+
+# mp3 classifier 
+mp3 classifier/audio/
